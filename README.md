@@ -1,8 +1,8 @@
 # Frontier State Cache IndexedDB
 
-IndexedDB persistence adapter for Frontier state-cache snapshots.
+IndexedDB persistence adapter for Frontier state-cache snapshots and durable cache change logs.
 
-This package provides a browser IndexedDB storage adapter for [`@shapeshift-labs/frontier-state-cache`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache). It lets applications keep using local in-memory query cache APIs while persisting cache snapshots across reloads.
+This package provides a browser IndexedDB storage adapter for [`@shapeshift-labs/frontier-state-cache`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache). It lets applications keep using local in-memory query cache APIs while persisting cache snapshots and post-checkpoint query/entity changes across reloads.
 
 - npm: [`@shapeshift-labs/frontier-state-cache-idb`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-idb)
 - source: [`siliconjungle/-shapeshift-labs-frontier-state-cache-idb`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-idb)
@@ -73,13 +73,18 @@ import { createQueryCacheIndexedDbStorageAdapter } from '@shapeshift-labs/fronti
 
 const cache = createQueryCache();
 const storage = createQueryCacheIndexedDbStorageAdapter({
-  databaseName: 'app-cache'
+  name: 'app-cache',
+  maxLogEntries: 512
 });
 
 const persistence = persistQueryCache(cache, storage, {
   autoHydrate: true,
-  debounceMs: 100
+  debounceMs: 100,
+  compactOnFlush: true,
+  replayChangeLog: true
 });
+
+await persistence.ready;
 
 cache.writeQuery(['todos'], [
   { __typename: 'Todo', id: 't1', text: 'ship', done: false }
@@ -103,24 +108,31 @@ Core exports:
 - `createQueryCacheIndexedDbStorageAdapter(options?)` creates a `QueryCacheStorageAdapter`.
 - `adapter.load()` reads the current persisted cache snapshot.
 - `adapter.save(snapshot)` writes one structured snapshot record.
-- `adapter.clear()` removes the snapshot record.
+- `adapter.appendChange(entry)` appends a durable cache change-log entry.
+- `adapter.readChangeLog(options?)` reads retained change-log entries, optionally after `sinceSeq` and up to `limit`.
+- `adapter.compact(snapshot?)` optionally writes a checkpoint snapshot and clears the retained change log in one write transaction.
+- `adapter.clear()` removes the snapshot record and retained change log.
 - `adapter.close()` closes the cached `IDBDatabase` handle.
 - `adapter.destroy()` closes and deletes the IndexedDB database.
 
 Options:
 
+- `name`: shorthand for the IndexedDB database name.
 - `databaseName`: IndexedDB database name. Defaults to `frontier-state-cache`.
 - `storeName`: object store name. Defaults to `snapshots`.
 - `snapshotKey`: record key for the cache snapshot. Defaults to `default`.
 - `version`: IndexedDB database version. Defaults to `1`.
 - `indexedDB`: explicit `IDBFactory`, useful for tests, workers, or alternate browser contexts.
+- `maxLogEntries`: optional retention cap for durable change-log entries. Defaults to unbounded adapter retention.
 - `onBlocked` and `onVersionChange`: lifecycle hooks for upgrade/delete/version-change events.
+
+Use `persistQueryCache(cache, storage, { compactOnFlush: true, replayChangeLog: true })` when retained IDB log entries should be replayed after the saved snapshot during hydration. Replay assumes retained entries are post-checkpoint entries; `compactOnFlush` provides that checkpoint-and-trim policy for this adapter.
 
 ## Package Scope
 
-This package owns only IndexedDB persistence for Frontier state-cache snapshots. It does not add a query cache runtime, mutation planner, CRDT sync provider, remote replication protocol, cross-tab broadcast layer, or arbitrary IndexedDB query abstraction.
+This package owns only IndexedDB persistence for Frontier state-cache snapshots and durable cache change logs. It does not add a query cache runtime, mutation planner, CRDT sync provider, remote replication protocol, cross-tab broadcast layer, or arbitrary IndexedDB query abstraction.
 
-Future package-local work may add durable change-log storage and cross-tab coordination, but those surfaces should stay opt-in and separate from the basic snapshot adapter.
+Future package-local work may add cross-tab coordination, multi-snapshot namespaces, and app-level migration helpers, but those surfaces should stay opt-in and separate from the basic snapshot/log adapter.
 
 ## TypeScript
 
@@ -143,14 +155,17 @@ Run the package-local benchmark:
 npm run bench
 ```
 
-Latest local package benchmark on Node v26.1.0 with the package test IndexedDB shim, 3 rounds:
+Latest local package benchmark on Node v26.1.0 with the package test IndexedDB shim, 3 rounds and 300 iterations:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| IDB snapshot save | 28,290 us | 30,774 us |
-| IDB snapshot load | 24,779 us | 25,180 us |
-| IDB persistence flush | 23,888 us | 29,805 us |
-| IDB snapshot clear | 2,397 us | 2,481 us |
+| IDB snapshot save | 30.39 ms | 31.07 ms |
+| IDB snapshot load | 27.26 ms | 29.24 ms |
+| IDB persistence flush | 26.46 ms | 33.25 ms |
+| IDB change-log append | 3.11 ms | 3.83 ms |
+| IDB change-log read | 2.79 ms | 2.89 ms |
+| IDB replay hydrate | 34.84 ms | 56.20 ms |
+| IDB snapshot clear | 2.39 ms | 2.52 ms |
 
 These are Frontier-only package measurements, not competitor comparisons. Browser IndexedDB implementations will differ from the test shim.
 

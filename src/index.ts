@@ -1,4 +1,5 @@
 import type {
+  QueryCacheChangeLogEntry,
   QueryCacheSnapshot,
   QueryCacheStorageAdapter
 } from '@shapeshift-labs/frontier-state-cache';
@@ -8,23 +9,34 @@ const DEFAULT_STORE_NAME = 'snapshots';
 const DEFAULT_SNAPSHOT_KEY = 'default';
 const DEFAULT_VERSION = 1;
 const RECORD_MAGIC = 'frontier-state-cache-idb';
+const CHANGE_LOG_MAGIC = 'frontier-state-cache-idb-change';
 const RECORD_VERSION = 1;
 
 export interface QueryCacheIndexedDbStorageOptions {
+  name?: string;
   databaseName?: string;
   storeName?: string;
   snapshotKey?: string;
   version?: number;
   indexedDB?: IDBFactory;
   now?: () => number;
+  maxLogEntries?: number;
   onBlocked?: (event: IDBVersionChangeEvent) => void;
   onVersionChange?: (event: IDBVersionChangeEvent) => void;
+}
+
+export interface QueryCacheIndexedDbChangeLogReadOptions {
+  sinceSeq?: number;
+  limit?: number;
 }
 
 export interface QueryCacheIndexedDbStorageAdapter extends QueryCacheStorageAdapter {
   readonly databaseName: string;
   readonly storeName: string;
   readonly snapshotKey: string;
+  appendChange(entry: QueryCacheChangeLogEntry): Promise<void>;
+  readChangeLog(options?: QueryCacheIndexedDbChangeLogReadOptions): Promise<QueryCacheChangeLogEntry[]>;
+  compact(snapshot?: QueryCacheSnapshot): Promise<void>;
   close(): void;
   destroy(): Promise<void>;
 }
@@ -37,6 +49,14 @@ type QueryCacheIndexedDbRecord = {
   snapshot: QueryCacheSnapshot;
 };
 
+type QueryCacheIndexedDbChangeLogRecord = {
+  key: string;
+  magic: typeof CHANGE_LOG_MAGIC;
+  version: typeof RECORD_VERSION;
+  updatedAt: number;
+  entries: QueryCacheChangeLogEntry[];
+};
+
 export function createQueryCacheIndexedDbStorageAdapter(
   options: string | QueryCacheIndexedDbStorageOptions = {}
 ): QueryCacheIndexedDbStorageAdapter {
@@ -44,6 +64,7 @@ export function createQueryCacheIndexedDbStorageAdapter(
   const databaseName = normalized.databaseName;
   const storeName = normalized.storeName;
   const snapshotKey = normalized.snapshotKey;
+  const changeLogKey = snapshotKey + '\u0000changes';
   const version = normalized.version;
   const now = normalized.now;
   const indexedDb = normalized.indexedDB;
@@ -74,7 +95,48 @@ export function createQueryCacheIndexedDbStorageAdapter(
       await runStore<IDBValidKey>('readwrite', (store) => store.put(record));
     },
     async clear() {
-      await runStore<undefined>('readwrite', (store) => store.delete(snapshotKey) as IDBRequest<undefined>);
+      await runWriteTransaction((store) => {
+        store.delete(snapshotKey);
+        store.delete(changeLogKey);
+      });
+    },
+    async appendChange(entry) {
+      assertChangeLogEntry(entry);
+      await updateChangeLogRecord((record) => {
+        record.entries.push(cloneChangeLogEntry(entry));
+        if (normalized.maxLogEntries > 0 && record.entries.length > normalized.maxLogEntries) {
+          record.entries = record.entries.slice(record.entries.length - normalized.maxLogEntries);
+        }
+        record.updatedAt = now();
+      });
+    },
+    async readChangeLog(options = {}) {
+      const record = await loadChangeLogRecord();
+      const sinceSeq = Number(options.sinceSeq);
+      const limit = readPositiveInt(options.limit, 0);
+      const entries: QueryCacheChangeLogEntry[] = [];
+      for (let i = 0; i < record.entries.length; i++) {
+        const entry = record.entries[i];
+        if (Number.isFinite(sinceSeq) && entry.seq <= sinceSeq) continue;
+        entries.push(cloneChangeLogEntry(entry));
+        if (limit > 0 && entries.length >= limit) break;
+      }
+      return entries;
+    },
+    async compact(snapshot) {
+      await runWriteTransaction((store) => {
+        if (snapshot !== undefined) {
+          const record: QueryCacheIndexedDbRecord = {
+            key: snapshotKey,
+            magic: RECORD_MAGIC,
+            version: RECORD_VERSION,
+            savedAt: now(),
+            snapshot: cloneSnapshot(snapshot)
+          };
+          store.put(record);
+        }
+        store.delete(changeLogKey);
+      });
     },
     close() {
       if (db !== undefined) db.close();
@@ -164,6 +226,92 @@ export function createQueryCacheIndexedDbStorageAdapter(
     });
   }
 
+  async function runWriteTransaction(operation: (store: IDBObjectStore) => void): Promise<void> {
+    const database = await getDb();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const transaction = database.transaction(storeName, 'readwrite');
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error instanceof Error ? error : new Error(String(error || 'IndexedDB transaction failed')));
+      };
+      transaction.onerror = () => fail(transaction.error || new Error('IndexedDB transaction failed'));
+      transaction.onabort = () => fail(transaction.error || new Error('IndexedDB transaction aborted'));
+      transaction.oncomplete = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      try {
+        operation(transaction.objectStore(storeName));
+      } catch (error) {
+        fail(error);
+      }
+    });
+  }
+
+  async function updateChangeLogRecord(mutator: (record: QueryCacheIndexedDbChangeLogRecord) => void): Promise<void> {
+    const database = await getDb();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const transaction = database.transaction(storeName, 'readwrite');
+      const store = transaction.objectStore(storeName);
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error instanceof Error ? error : new Error(String(error || 'IndexedDB transaction failed')));
+      };
+      transaction.onerror = () => fail(transaction.error || new Error('IndexedDB transaction failed'));
+      transaction.onabort = () => fail(transaction.error || new Error('IndexedDB transaction aborted'));
+      transaction.oncomplete = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+
+      const request = store.get(changeLogKey) as IDBRequest<QueryCacheIndexedDbChangeLogRecord | undefined>;
+      request.onerror = () => fail(request.error || new Error('IndexedDB request failed'));
+      request.onsuccess = () => {
+        try {
+          const record = normalizeChangeLogRecord(request.result);
+          mutator(record);
+          const putRequest = store.put(record);
+          putRequest.onerror = () => fail(putRequest.error || new Error('IndexedDB request failed'));
+        } catch (error) {
+          fail(error);
+        }
+      };
+    });
+  }
+
+  async function loadChangeLogRecord(): Promise<QueryCacheIndexedDbChangeLogRecord> {
+    const record = await runStore<QueryCacheIndexedDbChangeLogRecord | undefined>('readonly', (store) =>
+      store.get(changeLogKey) as IDBRequest<QueryCacheIndexedDbChangeLogRecord | undefined>
+    );
+    return normalizeChangeLogRecord(record);
+  }
+
+  function normalizeChangeLogRecord(record: QueryCacheIndexedDbChangeLogRecord | undefined | null): QueryCacheIndexedDbChangeLogRecord {
+    if (record === undefined || record === null) {
+      return {
+        key: changeLogKey,
+        magic: CHANGE_LOG_MAGIC,
+        version: RECORD_VERSION,
+        updatedAt: now(),
+        entries: []
+      };
+    }
+    assertChangeLogRecord(record);
+    return {
+      key: changeLogKey,
+      magic: CHANGE_LOG_MAGIC,
+      version: RECORD_VERSION,
+      updatedAt: record.updatedAt,
+      entries: record.entries.map(cloneChangeLogEntry)
+    };
+  }
+
   function deleteDatabase(): Promise<void> {
     return new Promise((resolve, reject) => {
       const request = getIndexedDb(indexedDb).deleteDatabase(databaseName);
@@ -176,16 +324,17 @@ export function createQueryCacheIndexedDbStorageAdapter(
   }
 }
 
-function normalizeOptions(options: string | QueryCacheIndexedDbStorageOptions): Required<Pick<QueryCacheIndexedDbStorageOptions, 'databaseName' | 'storeName' | 'snapshotKey' | 'version' | 'now'>> & QueryCacheIndexedDbStorageOptions {
+function normalizeOptions(options: string | QueryCacheIndexedDbStorageOptions): Required<Pick<QueryCacheIndexedDbStorageOptions, 'databaseName' | 'storeName' | 'snapshotKey' | 'version' | 'now' | 'maxLogEntries'>> & QueryCacheIndexedDbStorageOptions {
   const raw = typeof options === 'string' ? { databaseName: options } : options;
   const version = Number(raw.version);
   return {
     ...raw,
-    databaseName: normalizeName(raw.databaseName, DEFAULT_DATABASE_NAME, 'databaseName'),
+    databaseName: normalizeName(raw.databaseName === undefined ? raw.name : raw.databaseName, DEFAULT_DATABASE_NAME, 'databaseName'),
     storeName: normalizeName(raw.storeName, DEFAULT_STORE_NAME, 'storeName'),
     snapshotKey: normalizeName(raw.snapshotKey, DEFAULT_SNAPSHOT_KEY, 'snapshotKey'),
     version: Number.isFinite(version) && version >= 1 ? Math.floor(version) : DEFAULT_VERSION,
-    now: typeof raw.now === 'function' ? raw.now : Date.now
+    now: typeof raw.now === 'function' ? raw.now : Date.now,
+    maxLogEntries: readPositiveInt(raw.maxLogEntries, 0)
   };
 }
 
@@ -230,7 +379,35 @@ function assertRecord(record: QueryCacheIndexedDbRecord): void {
   }
 }
 
+function assertChangeLogRecord(record: QueryCacheIndexedDbChangeLogRecord): void {
+  if (record.magic !== CHANGE_LOG_MAGIC || record.version !== RECORD_VERSION || !Array.isArray(record.entries)) {
+    throw new Error('IndexedDB record is not a Frontier state-cache change log');
+  }
+  for (let i = 0; i < record.entries.length; i++) assertChangeLogEntry(record.entries[i]);
+}
+
+function assertChangeLogEntry(entry: QueryCacheChangeLogEntry): void {
+  if (
+    entry === null ||
+    typeof entry !== 'object' ||
+    !Number.isFinite(entry.seq) ||
+    typeof entry.type !== 'string'
+  ) {
+    throw new Error('Invalid Frontier state-cache change-log entry');
+  }
+}
+
+function cloneChangeLogEntry(entry: QueryCacheChangeLogEntry): QueryCacheChangeLogEntry {
+  if (typeof globalThis.structuredClone === 'function') return globalThis.structuredClone(entry);
+  return JSON.parse(JSON.stringify(entry)) as QueryCacheChangeLogEntry;
+}
+
 function cloneSnapshot(snapshot: QueryCacheSnapshot): QueryCacheSnapshot {
   if (typeof globalThis.structuredClone === 'function') return globalThis.structuredClone(snapshot);
   return JSON.parse(JSON.stringify(snapshot)) as QueryCacheSnapshot;
+}
+
+function readPositiveInt(value: unknown, fallback: number): number {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
 }

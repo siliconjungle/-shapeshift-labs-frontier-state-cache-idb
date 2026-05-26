@@ -16,6 +16,9 @@ const results = [
   await measureSnapshotSave(rows, queries, rounds),
   await measureSnapshotLoad(rows, queries, rounds),
   await measurePersistenceFlush(rows, queries, Math.max(30, Math.floor(iterations / 8))),
+  await measureChangeLogAppend(iterations),
+  await measureChangeLogRead(Math.max(30, Math.floor(iterations / 4))),
+  await measureReplayHydrate(rows, queries, Math.max(10, rounds * 4)),
   await measureClear(rounds)
 ];
 
@@ -76,6 +79,71 @@ async function measurePersistenceFlush(rowCount, queryCount, runs) {
   return summarize('idb persistence flush', samples, stats.saves);
 }
 
+async function measureChangeLogAppend(runs) {
+  const storage = createStorage('change-log-append', { maxLogEntries: runs + 1 });
+  const samples = [];
+  for (let i = 0; i < runs; i++) {
+    const start = performance.now();
+    await storage.appendChange({
+      seq: i + 1,
+      type: 'query',
+      key: ['todos', { page: i & 15 }],
+      hash: 'h' + (i & 15),
+      patchOperations: 1,
+      updatedAt: i
+    });
+    samples.push((performance.now() - start) * 1000);
+  }
+  await storage.destroy();
+  return summarize('idb change-log append', samples, runs);
+}
+
+async function measureChangeLogRead(runs) {
+  const storage = createStorage('change-log-read', { maxLogEntries: 512 });
+  for (let i = 0; i < 256; i++) {
+    await storage.appendChange({
+      seq: i + 1,
+      type: 'entity',
+      entityId: 'Todo:' + String(i & 31),
+      patchOperations: 1,
+      updatedAt: i
+    });
+  }
+  const samples = [];
+  let entries = 0;
+  for (let i = 0; i < runs; i++) {
+    const start = performance.now();
+    const batch = await storage.readChangeLog({ sinceSeq: i & 127, limit: 16 });
+    samples.push((performance.now() - start) * 1000);
+    entries += batch.length;
+  }
+  await storage.destroy();
+  return summarize('idb change-log read', samples, entries);
+}
+
+async function measureReplayHydrate(rowCount, queryCount, runs) {
+  const storage = await createReplayStorage('replay-hydrate', rowCount, queryCount, Math.max(16, Math.min(64, queryCount)));
+  const samples = [];
+  let replayedChanges = 0;
+  for (let i = 0; i < runs; i++) {
+    const cache = createQueryCache({ now: () => i });
+    const persistence = persistQueryCache(cache, storage, {
+      replayChangeLog: true,
+      debounceMs: 1000000
+    });
+    const start = performance.now();
+    const hydrated = await persistence.hydrate();
+    samples.push((performance.now() - start) * 1000);
+    if (!hydrated || cache.getQueryData(['todos', { page: 0 }]) === undefined) {
+      throw new Error('state-cache IDB replay hydrate fixture did not hydrate');
+    }
+    replayedChanges += persistence.getStats().replayedChanges;
+    persistence.dispose();
+  }
+  await storage.destroy();
+  return summarize('idb replay hydrate', samples, replayedChanges);
+}
+
 async function measureClear(runs) {
   const snapshot = seedCache(256, 8).extract();
   const samples = [];
@@ -90,10 +158,43 @@ async function measureClear(runs) {
   return summarize('idb snapshot clear', samples, runs);
 }
 
-function createStorage(name) {
+async function createReplayStorage(name, rowCount, queryCount, mutations) {
+  const storage = createStorage(name, { maxLogEntries: mutations * 3 });
+  const source = seedCache(rowCount, queryCount);
+  const persistence = persistQueryCache(source, storage, {
+    compactOnFlush: true,
+    debounceMs: 1000000
+  });
+  await persistence.flush();
+  const baselineWrites = persistence.getStats().changeLogWrites;
+  for (let i = 0; i < mutations; i++) {
+    const page = i % queryCount;
+    const id = 'Todo:' + String(((page * 31) % rowCount) + (i & 31));
+    source.modifyEntity(id, (todo) => ({
+      ...todo,
+      revision: Number(todo.revision || 0) + 1
+    }));
+  }
+  await waitForChangeLogFlush(persistence, baselineWrites);
+  persistence.dispose();
+  return storage;
+}
+
+async function waitForChangeLogFlush(persistence, baselineWrites) {
+  const deadline = performance.now() + 10000;
+  while (performance.now() < deadline) {
+    const stats = persistence.getStats();
+    if (stats.changeLogWrites > baselineWrites && stats.changeLogWrites === stats.changes) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error('Timed out waiting for persistence change log flush');
+}
+
+function createStorage(name, options = {}) {
   return createQueryCacheIndexedDbStorageAdapter({
     databaseName: 'frontier-idb-bench-' + name,
-    indexedDB: createFakeIndexedDB()
+    indexedDB: createFakeIndexedDB(),
+    ...options
   });
 }
 
