@@ -1,0 +1,58 @@
+{
+  "name": "@shapeshift-labs/frontier-state-cache-idb",
+  "version": "0.1.0",
+  "description": "IndexedDB persistence adapter for Frontier state-cache snapshots.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-idb.git"
+  },
+  "homepage": "https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-idb#readme",
+  "bugs": {
+    "url": "https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-idb/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "benchmarks/package-bench.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "npm run build && npm run typecheck && node test/smoke.mjs && node test/fuzz.mjs --cases 300",
+    "prepack": "npm run test",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit",
+    "fuzz": "npm run build && node test/fuzz.mjs",
+    "bench": "npm run build && node benchmarks/package-bench.mjs",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "keywords": [
+    "frontier",
+    "state-cache",
+    "indexeddb",
+    "idb",
+    "offline",
+    "local-first"
+  ],
+  "dependencies": {
+    "@shapeshift-labs/frontier-state-cache": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
